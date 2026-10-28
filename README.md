@@ -49,6 +49,41 @@ pip install -e .
 ```
 
 
-## OpenAI API Key
+## API key
 
-The Virtual Lab currently uses GPT-5.2 from OpenAI by default. Save your OpenAI API key as the environment variable `OPENAI_API_KEY`. For example, add `export OPENAI_API_KEY=<your_key>` to your `.bashrc` or `.bash_profile`.
+The Virtual Lab uses GPT-5.2 from OpenAI by default. Create a `.env` file in the project root:
+
+```bash
+cp .env.example .env
+```
+
+Then edit `.env` and replace the placeholder with your actual key:
+
+```
+OPENAI_API_KEY=your_openai_api_key_here
+```
+
+The `.env` file is automatically loaded when the package is imported via `python-dotenv`. The `.env` file is already included in `.gitignore` to prevent accidental commits of your API key.
+
+Alternatively, you can still export the environment variable directly (e.g., `export OPENAI_API_KEY=<your_key>` in your shell). Environment variables set in the shell take precedence over values in `.env`.
+
+### DeepSeek
+
+To call [DeepSeek](https://api-docs.deepseek.com/) instead of OpenAI, set `LLM_PROVIDER=deepseek` and a DeepSeek API key. The same OpenAI Python client is used with DeepSeek's OpenAI-compatible endpoint (`https://api.deepseek.com`).
+
+```
+LLM_PROVIDER=deepseek
+DEEPSEEK_API_KEY=your_deepseek_api_key_here
+```
+
+Agent definitions in this repo name OpenAI models (`gpt-5.2`, `gpt-4o-2024-08-06`, and so on). With `LLM_PROVIDER=deepseek`, those names are sent as `deepseek-flash` (DeepSeek-V4.1-Flash). Set `DEEPSEEK_MODEL=deepseek-v4-pro` to use DeepSeek-V4-Pro instead. An agent whose `model` already starts with `deepseek` keeps that id.
+
+Optional settings:
+
+```
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-flash
+DEEPSEEK_THINKING=disabled
+```
+
+`DEEPSEEK_THINKING` defaults to `disabled` so the meeting `temperature` is applied. Set it to `enabled` for DeepSeek's chain-of-thought mode. Thinking mode ignores `temperature`.

@@ -1,15 +1,20 @@
 """Runs a meeting with LLM agents."""
 
+import logging
+import re
 import time
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
-from openai import OpenAI, NOT_GIVEN
-from openai.types.chat import ChatCompletionAssistantMessageParam, ChatCompletionMessageParam, ChatCompletionToolParam
+from openai import BadRequestError, RateLimitError, OpenAI, NOT_GIVEN
+from openai.types.chat import ChatCompletionMessageParam, ChatCompletionToolParam
 from tqdm import trange, tqdm
+
+log = logging.getLogger(__name__)
 
 from virtual_lab.agent import Agent
 from virtual_lab.constants import CONSISTENT_TEMPERATURE, PUBMED_TOOL_DESCRIPTION
+from virtual_lab.provider import chat_completion_kwargs, create_client, get_provider, resolve_model
 from virtual_lab.prompts import (
     individual_meeting_agent_prompt,
     individual_meeting_critic_prompt,
@@ -88,18 +93,37 @@ def run_meeting(
     # Start timing the meeting
     start_time = time.time()
 
-    # Set up client
-    client = OpenAI()
+    # Set up client (OpenAI by default, or DeepSeek when LLM_PROVIDER=deepseek)
+    client = create_client()
 
     # Set up team
     if meeting_type == "team":
         assert team_lead is not None and team_members is not None
         team: list[Agent] = [team_lead] + list(team_members)
         primary_model = team_lead.model
+        critic: Agent | None = None
     else:
         assert team_member is not None
-        team = [team_member, SCIENTIFIC_CRITIC]
+        # Keep the critic on the same model as the team member. The package
+        # SCIENTIFIC_CRITIC uses DEFAULT_MODEL (gpt-5.2), which OpenAI flags as
+        # High-capability biology and rejects with error code `bio_policy`.
+        critic = Agent(
+            title=SCIENTIFIC_CRITIC.title,
+            expertise=SCIENTIFIC_CRITIC.expertise,
+            goal=SCIENTIFIC_CRITIC.goal,
+            role=SCIENTIFIC_CRITIC.role,
+            model=team_member.model,
+        )
+        team = [team_member, critic]
         primary_model = team_member.model
+
+    requested_model = primary_model
+    primary_model = resolve_model(primary_model)
+    if primary_model != requested_model:
+        print(
+            f"LLM provider {get_provider()}: calling {primary_model} "
+            f"(agents requested {requested_model})"
+        )
 
     # Set up tools
     tools: list[ChatCompletionToolParam] | None = (
@@ -162,10 +186,10 @@ def run_meeting(
                         team_member=agent, round_num=round_num, num_rounds=num_rounds
                     )
             else:
-                assert team_member is not None
+                assert team_member is not None and critic is not None
                 # Individual meeting prompts
-                if agent == SCIENTIFIC_CRITIC:
-                    prompt = individual_meeting_critic_prompt(critic=SCIENTIFIC_CRITIC, agent=team_member)
+                if agent == critic:
+                    prompt = individual_meeting_critic_prompt(critic=critic, agent=team_member)
                 else:
                     if round_index == 0:
                         prompt = individual_meeting_start_prompt(
@@ -177,7 +201,7 @@ def run_meeting(
                             contexts=contexts,
                         )
                     else:
-                        prompt = individual_meeting_agent_prompt(critic=SCIENTIFIC_CRITIC, agent=team_member)
+                        prompt = individual_meeting_agent_prompt(critic=critic, agent=team_member)
 
             # Add prompt as user message
             messages.append({"role": "user", "content": prompt})
@@ -186,11 +210,9 @@ def run_meeting(
             # Build messages for this agent with their system prompt
             agent_messages: list[ChatCompletionMessageParam] = [agent.message] + messages
 
-            # Call the chat completions API
-            response = client.chat.completions.create(
-                model=agent.model,
-                messages=agent_messages,
-                temperature=temperature,
+            # Call the chat completions API (with retry on rate limits)
+            response = _call_with_retry(
+                client, agent, agent_messages, temperature,
                 tools=tools if tools else NOT_GIVEN,
             )
 
@@ -205,13 +227,10 @@ def run_meeting(
                 # Update tool token count
                 tool_token_count += sum(count_tokens(output) for output in tool_outputs)
 
-                # Add the assistant's message with tool_calls to the messages
-                assistant_tool_message: ChatCompletionAssistantMessageParam = {
-                    "role": "assistant",
-                    "content": response_message.content,
-                    "tool_calls": [tc.model_dump() for tc in response_message.tool_calls],  # type: ignore[misc]
-                }
-                messages.append(assistant_tool_message)
+                # Add the assistant's message with tool_calls to the messages.
+                # DeepSeek thinking mode requires reasoning_content to be sent
+                # back on later requests that include tools.
+                messages.append(_assistant_api_message(response_message))
 
                 # Add tool response messages
                 for tool_msg in tool_messages:
@@ -224,10 +243,8 @@ def run_meeting(
                 # Make another API call with tool results
                 agent_messages = [agent.message] + messages
 
-                response = client.chat.completions.create(
-                    model=agent.model,
-                    messages=agent_messages,
-                    temperature=temperature,
+                response = _call_with_retry(
+                    client, agent, agent_messages, temperature,
                 )
                 response_message = response.choices[0].message
 
@@ -235,7 +252,7 @@ def run_meeting(
             response_content = response_message.content or ""
 
             # Add response to messages and discussion
-            messages.append({"role": "assistant", "content": response_content})
+            messages.append(_assistant_api_message(response_message))
             discussion.append({"agent": agent.title, "message": response_content})
 
             # If final round, only team lead or team member responds
@@ -268,3 +285,97 @@ def run_meeting(
         return get_summary(discussion)
 
     return None
+
+
+def _call_with_retry(
+    client: OpenAI,
+    agent: Agent,
+    messages: list[ChatCompletionMessageParam],
+    temperature: float,
+    tools: list[ChatCompletionToolParam] | object = NOT_GIVEN,
+    max_retries: int = 10,
+    initial_wait: float = 10.0,
+    max_wait: float = 120.0,
+):
+    """Call chat completions with exponential backoff on 429 RateLimitError.
+
+    :param client: The OpenAI client.
+    :param agent: The agent making the request (used for model and logging).
+    :param messages: The messages to send.
+    :param temperature: The sampling temperature.
+    :param tools: Tool definitions, or NOT_GIVEN.
+    :param max_retries: Maximum number of retries on rate-limit errors.
+    :param initial_wait: Initial backoff wait in seconds.
+    :param max_wait: Maximum backoff wait in seconds.
+    :return: The chat completion response.
+    """
+    wait = initial_wait
+    for attempt in range(max_retries + 1):
+        try:
+            return client.chat.completions.create(
+                model=resolve_model(agent.model),
+                messages=messages,
+                tools=tools,
+                **chat_completion_kwargs(temperature),
+            )
+        except RateLimitError as e:
+            if attempt == max_retries:
+                raise
+            retry_after = _parse_retry_after(e)
+            sleep_time = max(wait, retry_after) if retry_after else wait
+            log.warning(
+                "Rate limited (%s, %s), attempt %d/%d, sleeping %.1fs",
+                agent.title, resolve_model(agent.model), attempt + 1, max_retries, sleep_time,
+            )
+            print(
+                f"⏳ Rate limited ({agent.title}), "
+                f"attempt {attempt + 1}/{max_retries}, "
+                f"retrying in {sleep_time:.0f}s..."
+            )
+            time.sleep(sleep_time)
+            wait = min(wait * 2, max_wait)
+        except BadRequestError as e:
+            _reraise_model_request_error(e, agent)
+
+
+def _parse_retry_after(error: RateLimitError) -> float | None:
+    """Extract the suggested wait time from OpenAI's 429 error message."""
+    msg = str(error)
+    match = re.search(r"try again in (\d+\.?\d*)s", msg, re.IGNORECASE)
+    if match:
+        return float(match.group(1)) + 1.0
+    return None
+
+
+def _reraise_model_request_error(error: BadRequestError, agent: Agent) -> None:
+    """Re-raise API 400s with context when OpenAI blocks a biology prompt."""
+    error_body = error.body if isinstance(error.body, dict) else {}
+    nested_error = error_body.get("error", {}) if isinstance(error_body, dict) else {}
+    error_code = nested_error.get("code") if isinstance(nested_error, dict) else None
+    if error_code == "bio_policy" or "bio_policy" in str(error):
+        raise RuntimeError(
+            f"OpenAI rejected this request as biological-risk content (bio_policy) "
+            f"for model {agent.model} ({agent.title}). GPT-5.x models apply stricter "
+            f"biology filters than GPT-4o. The published nanobody notebook uses "
+            f"gpt-4o-2024-08-06; keep all agents on that model."
+        ) from error
+    raise error
+
+
+def _assistant_api_message(response_message) -> ChatCompletionMessageParam:
+    """Builds an assistant message to send back on the next turn.
+
+    ``reasoning_content`` is included when the provider returns it. DeepSeek
+    thinking mode rejects later tool-using requests that drop it.
+    """
+    message: dict[str, object] = {
+        "role": "assistant",
+        "content": response_message.content or "",
+    }
+    reasoning_content = getattr(response_message, "reasoning_content", None)
+    if reasoning_content:
+        message["reasoning_content"] = reasoning_content
+    if response_message.tool_calls:
+        message["content"] = response_message.content
+        message["tool_calls"] = [tc.model_dump() for tc in response_message.tool_calls]
+    return cast(ChatCompletionMessageParam, message)

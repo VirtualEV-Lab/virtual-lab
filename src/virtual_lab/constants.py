@@ -2,6 +2,11 @@
 
 DEFAULT_MODEL = "gpt-5.2"
 
+# DeepSeek is OpenAI-compatible. `deepseek-flash` is DeepSeek-V4.1-Flash.
+# `deepseek-v4-flash` is a retired alias that still routes to Flash.
+DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
+DEFAULT_DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+
 # Prices in USD as of December 30, 2025 (https://openai.com/api/pricing/)
 MODEL_TO_INPUT_PRICE_PER_TOKEN = {
     "gpt-3.5-turbo-0125": 0.5 / 10**6,
@@ -14,6 +19,11 @@ MODEL_TO_INPUT_PRICE_PER_TOKEN = {
     "gpt-5-nano": 0.05 / 10**6,
     "gpt-5.2": 1.75 / 10**6,
     "gpt-5.2-pro": 21 / 10**6,
+    # DeepSeek off-peak cache-miss rates (https://api-docs.deepseek.com/quick_start/pricing).
+    # Weekday peak hours (01:00–04:00 and 06:00–10:00 UTC) bill at 2x.
+    "deepseek-flash": 0.15 / 10**6,
+    "deepseek-v4-flash": 0.15 / 10**6,
+    "deepseek-v4-pro": 0.66 / 10**6,
 }
 
 MODEL_TO_OUTPUT_PRICE_PER_TOKEN = {
@@ -27,6 +37,9 @@ MODEL_TO_OUTPUT_PRICE_PER_TOKEN = {
     "gpt-5-nano": 0.4 / 10**6,
     "gpt-5.2": 14 / 10**6,
     "gpt-5.2-pro": 168 / 10**6,
+    "deepseek-flash": 0.60 / 10**6,
+    "deepseek-v4-flash": 0.60 / 10**6,
+    "deepseek-v4-pro": 1.98 / 10**6,
 }
 
 FINETUNING_MODEL_TO_INPUT_PRICE_PER_TOKEN = {

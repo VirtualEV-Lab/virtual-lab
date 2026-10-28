@@ -38,6 +38,16 @@ class Agent:
             "content": self.prompt,
         }
 
+    def with_model(self, model: str) -> "Agent":
+        """Returns a copy of this agent that uses a different model."""
+        return Agent(
+            title=self.title,
+            expertise=self.expertise,
+            goal=self.goal,
+            role=self.role,
+            model=model,
+        )
+
     def __hash__(self) -> int:
         """Returns the hash of the agent."""
         return hash(self.title)

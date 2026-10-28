@@ -10,11 +10,14 @@ num_iterations = 5
 num_rounds = 3
 
 # Models
+# The published nanobody pipeline uses GPT-4o. GPT-5.x models are treated by OpenAI as
+# High capability in biology and reject these SARS-CoV-2 nanobody prompts with
+# error code `bio_policy`.
 model = "gpt-4o-2024-08-06"
 model_mini = "gpt-4o-mini-2024-07-18"
 
-# Discussion paths
-discussions_dir = Path("discussions")
+# Discussion paths (relative to this file so the notebook cwd does not matter)
+discussions_dir = Path(__file__).resolve().parent / "discussions"
 workflow_phases = [
     "team_selection",
     "project_specification",
@@ -88,8 +91,16 @@ principal_investigator = Agent(
     model=model,
 )
 
-# Scientific critic
-scientific_critic = SCIENTIFIC_CRITIC
+# Scientific critic — same role as the package default, but on the nanobody model.
+# The package SCIENTIFIC_CRITIC uses DEFAULT_MODEL (gpt-5.2), which OpenAI blocks
+# for this SARS-CoV-2 nanobody agenda (`bio_policy`).
+scientific_critic = Agent(
+    title=SCIENTIFIC_CRITIC.title,
+    expertise=SCIENTIFIC_CRITIC.expertise,
+    goal=SCIENTIFIC_CRITIC.goal,
+    role=SCIENTIFIC_CRITIC.role,
+    model=model,
+)
 
 # Specialized science agents
 immunologist = Agent(
